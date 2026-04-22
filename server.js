@@ -24,11 +24,11 @@ const client = wrapper(
 )
 
 let sessionValid = false
+let loginPromise = null
 
 async function login() {
   console.log('[auth] Iniciando sesión...')
 
-  // 1. GET login page → obtener CSRF token y cookies iniciales
   const loginPage = await axios.get(`${BASE_URL}/login`, {
     jar,
     withCredentials: true,
@@ -39,13 +39,11 @@ async function login() {
   if (!csrfMatch) throw new Error('No se encontró el _token CSRF en la página de login')
   const csrfToken = csrfMatch[1]
 
-  // Guardar cookies de la página de login en el jar
   const setCookies = loginPage.headers['set-cookie'] || []
   for (const cookie of setCookies) {
     await jar.setCookie(cookie, BASE_URL)
   }
 
-  // 2. POST credenciales
   const body = new URLSearchParams({
     email: process.env.FACTURAOFITEC_EMAIL,
     password: process.env.FACTURAOFITEC_PASSWORD,
@@ -57,7 +55,6 @@ async function login() {
     maxRedirects: 5,
   })
 
-  // Verificar que no quedamos en la página de login (credenciales inválidas)
   if (typeof loginRes.data === 'string' && loginRes.data.includes('Ingresa a tu cuenta')) {
     throw new Error('Credenciales inválidas para facturaofitec')
   }
@@ -67,7 +64,12 @@ async function login() {
 }
 
 async function ensureSession() {
-  if (!sessionValid) await login()
+  if (sessionValid) return
+  // Si ya hay un login en curso, todas las requests esperan al mismo
+  if (!loginPromise) {
+    loginPromise = login().finally(() => { loginPromise = null })
+  }
+  await loginPromise
 }
 
 function isHtmlResponse(data) {
@@ -78,8 +80,16 @@ function isHtmlResponse(data) {
 
 const app = express()
 
+const allowedOrigins = (process.env.ALLOWED_ORIGIN || '*').split(',').map((o) => o.trim())
+
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*',
+  origin: (origin, cb) => {
+    if (allowedOrigins.includes('*') || !origin || allowedOrigins.includes(origin)) {
+      cb(null, true)
+    } else {
+      cb(new Error(`Origen no permitido: ${origin}`))
+    }
+  },
 }))
 
 app.use(express.json())

@@ -76,6 +76,41 @@ function isHtmlResponse(data) {
   return typeof data === 'string' && data.trimStart().startsWith('<')
 }
 
+// ─── Caché de clientes ───────────────────────────────────────────────────────
+
+let customerMap = {}
+let customerCacheLastUpdated = null
+const CUSTOMER_CACHE_TTL = 24 * 60 * 60 * 1000
+
+async function loadCustomerCache() {
+  console.log('[cache] Cargando catálogo de clientes...')
+  try {
+    await ensureSession()
+    const first = await client.get('/persons/customers/records', { params: { page: 1 } })
+    const lastPage = first.data.meta.last_page
+
+    const rest = lastPage > 1
+      ? await Promise.all(
+          Array.from({ length: lastPage - 1 }, (_, i) =>
+            client.get('/persons/customers/records', { params: { page: i + 2 } })
+          )
+        )
+      : []
+
+    const all = [...first.data.data, ...rest.flatMap((r) => r.data.data)]
+    customerMap = {}
+    for (const c of all) {
+      customerMap[c.id] = { person_type_id: c.person_type_id, person_type: c.person_type || '' }
+    }
+    customerCacheLastUpdated = new Date().toISOString()
+    console.log(`[cache] ${all.length} clientes cargados`)
+  } catch (e) {
+    console.error('[cache] Error cargando clientes:', e.message)
+  }
+}
+
+setInterval(loadCustomerCache, CUSTOMER_CACHE_TTL)
+
 // ─── Express ────────────────────────────────────────────────────────────────
 
 const app = express()
@@ -94,7 +129,29 @@ app.use(cors({
 
 app.use(express.json())
 
-app.get('/health', (_req, res) => res.json({ ok: true, session: sessionValid }))
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  session: sessionValid,
+  customer_cache_size: Object.keys(customerMap).length,
+  customer_cache_updated: customerCacheLastUpdated,
+}))
+
+app.get('/customers-cache', (_req, res) => {
+  res.json({
+    data: customerMap,
+    total: Object.keys(customerMap).length,
+    last_updated: customerCacheLastUpdated,
+  })
+})
+
+app.post('/customers-cache/refresh', async (_req, res) => {
+  try {
+    await loadCustomerCache()
+    res.json({ ok: true, total: Object.keys(customerMap).length, last_updated: customerCacheLastUpdated })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
 
 // Proxy: /proxy/reports/sales/records → oceans.facturaofitec.com/reports/sales/records
 // Proxy: /proxy/api/documents/lists/...  → oceans.facturaofitec.com/api/documents/lists/...
@@ -136,5 +193,7 @@ const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
   console.log(`Proxy corriendo en http://localhost:${PORT}`)
   // Login proactivo al arrancar
-  login().catch((e) => console.error('[auth] Error en login inicial:', e.message))
+  login()
+    .then(() => loadCustomerCache())
+    .catch((e) => console.error('[auth] Error en login inicial:', e.message))
 })

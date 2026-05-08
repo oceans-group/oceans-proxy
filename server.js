@@ -100,7 +100,18 @@ async function loadCustomerCache() {
     const all = [...first.data.data, ...rest.flatMap((r) => r.data.data)]
     customerMap = {}
     for (const c of all) {
-      customerMap[c.id] = { person_type_id: c.person_type_id, person_type: c.person_type || '' }
+      customerMap[c.id] = {
+      person_type_id: c.person_type_id,
+      person_type: c.person_type || '',
+      telephone: c.telephone || null,
+      address: c.address || null,
+      birthday: c.birthday || null,
+      email: c.email || null,
+      state: c.state || null,
+      district: c.district?.description || null,
+      province: c.province?.description || null,
+      department: c.department?.description || null,
+    }
     }
     customerCacheLastUpdated = new Date().toISOString()
     console.log(`[cache] ${all.length} clientes cargados`)

@@ -65,7 +65,6 @@ async function login() {
 
 async function ensureSession() {
   if (sessionValid) return
-  // Si ya hay un login en curso, todas las requests esperan al mismo
   if (!loginPromise) {
     loginPromise = login().finally(() => { loginPromise = null })
   }
@@ -76,53 +75,7 @@ function isHtmlResponse(data) {
   return typeof data === 'string' && data.trimStart().startsWith('<')
 }
 
-// ─── Caché de clientes ───────────────────────────────────────────────────────
-
-let customerMap = {}
-let customerCacheLastUpdated = null
-const CUSTOMER_CACHE_TTL = 24 * 60 * 60 * 1000
-
-async function loadCustomerCache() {
-  console.log('[cache] Cargando catálogo de clientes...')
-  try {
-    await ensureSession()
-    const first = await client.get('/persons/customers/records', { params: { page: 1 } })
-    const lastPage = first.data.meta.last_page
-
-    const rest = lastPage > 1
-      ? await Promise.all(
-          Array.from({ length: lastPage - 1 }, (_, i) =>
-            client.get('/persons/customers/records', { params: { page: i + 2 } })
-          )
-        )
-      : []
-
-    const all = [...first.data.data, ...rest.flatMap((r) => r.data.data)]
-    customerMap = {}
-    for (const c of all) {
-      customerMap[c.id] = {
-      person_type_id: c.person_type_id,
-      person_type: c.person_type || '',
-      telephone: c.telephone || null,
-      address: c.address || null,
-      birthday: c.birthday || null,
-      email: c.email || null,
-      state: c.state || null,
-      district: c.district?.description || null,
-      province: c.province?.description || null,
-      department: c.department?.description || null,
-    }
-    }
-    customerCacheLastUpdated = new Date().toISOString()
-    console.log(`[cache] ${all.length} clientes cargados`)
-  } catch (e) {
-    console.error('[cache] Error cargando clientes:', e.message)
-  }
-}
-
-setInterval(loadCustomerCache, CUSTOMER_CACHE_TTL)
-
-// ─── Express ────────────────────────────────────────────────────────────────
+// ─── Express ─────────────────────────────────────────────────────────────────
 
 const app = express()
 
@@ -140,32 +93,8 @@ app.use(cors({
 
 app.use(express.json())
 
-app.get('/health', (_req, res) => res.json({
-  ok: true,
-  session: sessionValid,
-  customer_cache_size: Object.keys(customerMap).length,
-  customer_cache_updated: customerCacheLastUpdated,
-}))
+app.get('/health', (_req, res) => res.json({ ok: true, session: sessionValid }))
 
-app.get('/customers-cache', (_req, res) => {
-  res.json({
-    data: customerMap,
-    total: Object.keys(customerMap).length,
-    last_updated: customerCacheLastUpdated,
-  })
-})
-
-app.post('/customers-cache/refresh', async (_req, res) => {
-  try {
-    await loadCustomerCache()
-    res.json({ ok: true, total: Object.keys(customerMap).length, last_updated: customerCacheLastUpdated })
-  } catch (e) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// Proxy: /proxy/reports/sales/records → oceans.facturaofitec.com/reports/sales/records
-// Proxy: /proxy/api/documents/lists/...  → oceans.facturaofitec.com/api/documents/lists/...
 app.get('/proxy/*path', async (req, res) => {
   const segments = req.params.path
   const path = '/' + (Array.isArray(segments) ? segments.join('/') : segments)
@@ -182,7 +111,6 @@ app.get('/proxy/*path', async (req, res) => {
       headers: extraHeaders,
     })
 
-    // Si devuelve HTML significa que la sesión expiró → re-login y retry
     if (isHtmlResponse(response.data)) {
       console.log('[auth] Sesión expirada, re-autenticando...')
       sessionValid = false
@@ -203,8 +131,5 @@ app.get('/proxy/*path', async (req, res) => {
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
   console.log(`Proxy corriendo en http://localhost:${PORT}`)
-  // Login proactivo al arrancar
-  login()
-    .then(() => loadCustomerCache())
-    .catch((e) => console.error('[auth] Error en login inicial:', e.message))
+  login().catch((e) => console.error('[auth] Error en login inicial:', e.message))
 })

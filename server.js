@@ -3,9 +3,15 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 
 const express = require('express')
 const axios = require('axios')
+const crypto = require('crypto')
 const { CookieJar } = require('tough-cookie')
 const { wrapper } = require('axios-cookiejar-support')
 const cors = require('cors')
+
+if (!process.env.AUTH_TOKEN_SECRET) {
+  console.error('[auth] Falta AUTH_TOKEN_SECRET en el .env — es requerido para firmar los tokens de sesión del login.')
+  process.exit(1)
+}
 
 const BASE_URL = 'https://oceans.facturaofitec.com'
 
@@ -75,6 +81,51 @@ function isHtmlResponse(data) {
   return typeof data === 'string' && data.trimStart().startsWith('<')
 }
 
+// ─── Login de la app (usuario/contraseña del .env → token de sesión) ─────────
+
+const AUTH_TOKEN_TTL_MS = 12 * 60 * 60 * 1000 // 12h
+
+function signToken(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url')
+  const sig = crypto.createHmac('sha256', process.env.AUTH_TOKEN_SECRET).update(body).digest('base64url')
+  return `${body}.${sig}`
+}
+
+function verifyToken(token) {
+  if (!token || typeof token !== 'string') return null
+  const [body, sig] = token.split('.')
+  if (!body || !sig) return null
+
+  const expectedSig = crypto.createHmac('sha256', process.env.AUTH_TOKEN_SECRET).update(body).digest('base64url')
+  const sigBuf = Buffer.from(sig)
+  const expectedBuf = Buffer.from(expectedSig)
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) return null
+
+  let payload
+  try {
+    payload = JSON.parse(Buffer.from(body, 'base64url').toString())
+  } catch {
+    return null
+  }
+  if (!payload.exp || Date.now() > payload.exp) return null
+  return payload
+}
+
+function timingSafeStringEqual(a, b) {
+  const aBuf = Buffer.from(String(a ?? ''))
+  const bBuf = Buffer.from(String(b ?? ''))
+  if (aBuf.length !== bBuf.length) return false
+  return crypto.timingSafeEqual(aBuf, bBuf)
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null
+  const payload = verifyToken(token)
+  if (!payload) return res.status(401).json({ error: 'No autorizado' })
+  next()
+}
+
 // ─── Express ─────────────────────────────────────────────────────────────────
 
 const app = express()
@@ -95,7 +146,21 @@ app.use(express.json())
 
 app.get('/health', (_req, res) => res.json({ ok: true, session: sessionValid }))
 
-app.get('/proxy/*path', async (req, res) => {
+app.post('/login', (req, res) => {
+  const { email, password } = req.body || {}
+  const validEmail = timingSafeStringEqual(email, process.env.FACTURAOFITEC_EMAIL)
+  const validPassword = timingSafeStringEqual(password, process.env.FACTURAOFITEC_PASSWORD)
+
+  if (!validEmail || !validPassword) {
+    return res.status(401).json({ error: 'Usuario o contraseña incorrectos' })
+  }
+
+  const expires_at = Date.now() + AUTH_TOKEN_TTL_MS
+  const token = signToken({ exp: expires_at })
+  res.json({ token, expires_at })
+})
+
+app.get('/proxy/*path', requireAuth, async (req, res) => {
   const segments = req.params.path
   const path = '/' + (Array.isArray(segments) ? segments.join('/') : segments)
 

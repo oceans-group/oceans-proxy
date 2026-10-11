@@ -131,31 +131,66 @@ function requireAuth(req, res, next) {
 
 const app = express()
 
-const allowedOrigins = (process.env.ALLOWED_ORIGIN || '*').split(',').map((o) => o.trim())
+// Render atiende detrás de un proxy: req.ip toma la IP real de X-Forwarded-For (un salto)
+app.set('trust proxy', 1)
 
+// Sin ALLOWED_ORIGIN solo se acepta el frontend publicado; '*' hay que configurarlo explícitamente
+const DEFAULT_ORIGIN = 'https://oceans-group.github.io'
+if (!process.env.ALLOWED_ORIGIN) console.warn(`[cors] Falta ALLOWED_ORIGIN en el .env — solo se acepta ${DEFAULT_ORIGIN}`)
+const allowedOrigins = (process.env.ALLOWED_ORIGIN || DEFAULT_ORIGIN).split(',').map((o) => o.trim())
+
+// Un origen no permitido no recibe cabeceras CORS y el navegador bloquea la respuesta
 app.use(cors({
-  origin: (origin, cb) => {
-    if (allowedOrigins.includes('*') || !origin || allowedOrigins.includes(origin)) {
-      cb(null, true)
-    } else {
-      cb(new Error(`Origen no permitido: ${origin}`))
-    }
-  },
+  origin: (origin, cb) => cb(null, allowedOrigins.includes('*') || !origin || allowedOrigins.includes(origin)),
 }))
 
 app.use(express.json())
 
 app.get('/health', (_req, res) => res.json({ ok: true, session: sessionValid }))
 
+// ─── Límite de intentos de login (en memoria: se reinicia con el proceso) ────
+
+const LOGIN_MAX_FAILURES = 5
+const LOGIN_WINDOW_MS = 15 * 60 * 1000
+const loginFailures = new Map() // ip → { count, resetAt }
+
+function loginBlockedUntil(ip) {
+  const entry = loginFailures.get(ip)
+  if (!entry) return 0
+  if (Date.now() > entry.resetAt) {
+    loginFailures.delete(ip)
+    return 0
+  }
+  return entry.count >= LOGIN_MAX_FAILURES ? entry.resetAt : 0
+}
+
+function registerLoginFailure(ip) {
+  const now = Date.now()
+  const entry = loginFailures.get(ip)
+  if (entry && now <= entry.resetAt) entry.count++
+  else loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS })
+  if (loginFailures.size > 1000) {
+    for (const [key, e] of loginFailures) if (now > e.resetAt) loginFailures.delete(key)
+  }
+}
+
 app.post('/login', (req, res) => {
+  const blockedUntil = loginBlockedUntil(req.ip)
+  if (blockedUntil) {
+    res.set('Retry-After', String(Math.ceil((blockedUntil - Date.now()) / 1000)))
+    return res.status(429).json({ error: 'Demasiados intentos fallidos. Intenta de nuevo en unos minutos.' })
+  }
+
   const { email, password } = req.body || {}
   const validEmail = timingSafeStringEqual(email, process.env.FACTURAOFITEC_EMAIL)
   const validPassword = timingSafeStringEqual(password, process.env.FACTURAOFITEC_PASSWORD)
 
   if (!validEmail || !validPassword) {
+    registerLoginFailure(req.ip)
     return res.status(401).json({ error: 'Usuario o contraseña incorrectos' })
   }
 
+  loginFailures.delete(req.ip)
   const expires_at = Date.now() + AUTH_TOKEN_TTL_MS
   const token = signToken({ exp: expires_at })
   res.json({ token, expires_at })

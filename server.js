@@ -1,11 +1,12 @@
 require('dotenv').config()
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 
 const express = require('express')
 const axios = require('axios')
 const crypto = require('crypto')
+const fs = require('fs')
+const tls = require('tls')
 const { CookieJar } = require('tough-cookie')
-const { wrapper } = require('axios-cookiejar-support')
+const { HttpsCookieAgent } = require('http-cookie-agent/http')
 const cors = require('cors')
 
 if (!process.env.AUTH_TOKEN_SECRET) {
@@ -15,19 +16,23 @@ if (!process.env.AUTH_TOKEN_SECRET) {
 
 const BASE_URL = 'https://oceans.facturaofitec.com'
 
+// facturaofitec no envía su certificado intermedio: se completa la cadena con certs/
+// en lugar de desactivar la verificación TLS (ver el encabezado del .pem).
 const jar = new CookieJar()
-const client = wrapper(
-  axios.create({
-    jar,
-    baseURL: BASE_URL,
-    withCredentials: true,
-    headers: {
-      'Accept': 'application/json, text/plain, */*',
-      'X-Requested-With': 'XMLHttpRequest',
-      'User-Agent': 'Mozilla/5.0',
-    },
-  }),
-)
+const httpsAgent = new HttpsCookieAgent({
+  cookies: { jar },
+  ca: [...tls.rootCertificates, fs.readFileSync(`${__dirname}/certs/facturaofitec-chain.pem`, 'utf8')],
+})
+
+const client = axios.create({
+  baseURL: BASE_URL,
+  httpsAgent,
+  headers: {
+    'Accept': 'application/json, text/plain, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    'User-Agent': 'Mozilla/5.0',
+  },
+})
 
 let sessionValid = false
 let loginPromise = null
@@ -35,20 +40,16 @@ let loginPromise = null
 async function login() {
   console.log('[auth] Iniciando sesión...')
 
+  // Login siempre desde cero; las cookies nuevas (sesión + XSRF) las guarda el httpsAgent en el jar
+  await jar.removeAllCookies()
   const loginPage = await axios.get(`${BASE_URL}/login`, {
-    jar,
-    withCredentials: true,
+    httpsAgent,
     headers: { 'User-Agent': 'Mozilla/5.0' },
   })
 
   const csrfMatch = loginPage.data.match(/name="_token"\s+value="([^"]+)"/)
   if (!csrfMatch) throw new Error('No se encontró el _token CSRF en la página de login')
   const csrfToken = csrfMatch[1]
-
-  const setCookies = loginPage.headers['set-cookie'] || []
-  for (const cookie of setCookies) {
-    await jar.setCookie(cookie, BASE_URL)
-  }
 
   const body = new URLSearchParams({
     email: process.env.FACTURAOFITEC_EMAIL,
@@ -189,7 +190,8 @@ app.get('/proxy/*path', requireAuth, async (req, res) => {
     const status = err.response?.status
     if (status === 401 || status === 302) sessionValid = false
     console.error(`[error] ${path}:`, err.message)
-    res.status(status || 500).json({ error: err.message })
+    // Un 401 de facturaofitec no es un 401 de la app: si se reenvía, el frontend cierra la sesión del usuario
+    res.status(status === 401 ? 502 : status || 500).json({ error: err.message })
   }
 })
 
